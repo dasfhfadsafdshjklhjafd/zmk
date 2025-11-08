@@ -209,6 +209,45 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     int "Max number of mouse HID reports to queue for sending over BLE"
     default 20
 
+config ZMK_BLE_FORCE_CONN_PARAMS
+    bool "Enforce preferred BLE connection parameters"
+    help
+      Keep requesting preferred interval/latency after connection updates so hosts that wake from
+      sleep or apply power saving policies do not leave the device stuck with a sluggish link.
+
+if ZMK_BLE_FORCE_CONN_PARAMS
+
+config ZMK_BLE_FORCE_CONN_PARAMS_MAX_INTERVAL
+    int "Maximum acceptable connection interval (1.25 ms units)"
+    default 6
+    range 6 4000
+
+config ZMK_BLE_FORCE_CONN_PARAMS_MAX_LATENCY
+    int "Maximum acceptable slave latency"
+    default 0
+    range 0 499
+
+config ZMK_BLE_FORCE_CONN_PARAMS_RETRY_MS
+    int "Cooldown before retrying a parameter update (ms)"
+    default 500
+    range 20 10000
+
+config ZMK_BLE_FORCE_CONN_PARAMS_MAX_RETRIES
+    int "Action after consecutive failed parameter requests"
+    default 4
+    range 0 50
+    help
+      Set to 0 to keep retrying forever. Non-zero values limit the number of retries before an
+      optional disconnect is triggered.
+
+config ZMK_BLE_FORCE_CONN_PARAMS_DISCONNECT
+    bool "Disconnect if the host refuses preferred parameters"
+    help
+      Drop the active connection after the configured retry count and wait for the host to reconnect.
+      Helpful when certain OSes only renegotiate cleanly after a fresh connection.
+
+endif # ZMK_BLE_FORCE_CONN_PARAMS
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

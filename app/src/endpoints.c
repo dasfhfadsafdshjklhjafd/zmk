@@ -223,6 +223,8 @@ int zmk_endpoints_send_mouse_report() {
         int err = zmk_hog_send_mouse_report(&mouse_report->body);
         if (err) {
             LOG_ERR("FAILED TO SEND OVER HOG: %d", err);
+        } else {
+            zmk_ble_notify_activity();
         }
         return err;
 #else

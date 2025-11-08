@@ -6,6 +6,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 
 #include <errno.h>
 #include <math.h>
@@ -63,8 +64,217 @@ enum advertising_type {
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+
+#if defined(CONFIG_EFOG_BLE_CONN_PARAMS_RESUME_DELAY)
+#define BLE_CONN_PARAMS_RESUME_DELAY_MS CONFIG_EFOG_BLE_CONN_PARAMS_RESUME_DELAY
+#else
+#define BLE_CONN_PARAMS_RESUME_DELAY_MS 200
+#endif
+
+static bool force_conn_params_waiting_for_activity;
+
+static uint16_t preferred_conn_min_interval = CONFIG_EFOG_BLE_BASE_MIN_INT;
+static uint16_t preferred_conn_max_interval = CONFIG_EFOG_BLE_BASE_MAX_INT;
+static uint16_t preferred_conn_latency = CONFIG_EFOG_BLE_BASE_LATENCY;
+static uint16_t preferred_conn_timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT;
+
+enum conn_param_mode { CONN_PARAMS_MODE_BASE, CONN_PARAMS_MODE_FAST };
+static enum conn_param_mode conn_params_mode = CONN_PARAMS_MODE_BASE;
+
+static bool fast_conn_params_pending;
+static uint8_t fast_conn_params_attempts;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+static bool fast_conn_params_disconnecting;
+#endif
+
+static void force_conn_params_after_activity(struct k_work *work);
+static void fast_conn_params_work_handler(struct k_work *work);
+
+static K_WORK_DELAYABLE_DEFINE(force_conn_params_after_activity_work,
+                               force_conn_params_after_activity);
+static K_WORK_DELAYABLE_DEFINE(fast_conn_params_work, fast_conn_params_work_handler);
+
+#endif
+
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+static int64_t force_conn_params_last_request;
+static uint8_t force_conn_params_failures;
+
+static inline bool conn_params_cooldown_expired(int64_t now) {
+    return (force_conn_params_last_request == 0) ||
+           (now - force_conn_params_last_request >= CONFIG_ZMK_BLE_FORCE_CONN_PARAMS_RETRY_MS);
+}
+
+static void conn_params_use_base(void) {
+    preferred_conn_min_interval = CONFIG_EFOG_BLE_BASE_MIN_INT;
+    preferred_conn_max_interval = CONFIG_EFOG_BLE_BASE_MAX_INT;
+    preferred_conn_latency = CONFIG_EFOG_BLE_BASE_LATENCY;
+    conn_params_mode = CONN_PARAMS_MODE_BASE;
+}
+
+static void conn_params_use_fast(void) {
+    preferred_conn_min_interval = CONFIG_EFOG_BLE_FAST_MIN_INT;
+    preferred_conn_max_interval = CONFIG_EFOG_BLE_FAST_MAX_INT;
+    preferred_conn_latency = CONFIG_EFOG_BLE_FAST_LATENCY;
+    conn_params_mode = CONN_PARAMS_MODE_FAST;
+}
+
+static inline bool intervals_match_fast(uint16_t interval, uint16_t latency) {
+    return interval <= CONFIG_EFOG_BLE_FAST_MAX_INT && latency <= CONFIG_EFOG_BLE_FAST_LATENCY;
+}
+
+static void fast_conn_params_schedule(int32_t delay_ms, bool reset_attempts) {
+    if (delay_ms < 0) {
+        delay_ms = 0;
+    }
+    if (reset_attempts) {
+        fast_conn_params_attempts = 0;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+        fast_conn_params_disconnecting = false;
+#endif
+    }
+
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+    if (fast_conn_params_disconnecting) {
+        return;
+    }
+#endif
+
+    fast_conn_params_pending = true;
+    k_work_reschedule(&fast_conn_params_work, K_MSEC(delay_ms));
+}
+
+static void force_conn_params_request(struct bt_conn *conn, bool ignore_cooldown) {
+    int64_t now = k_uptime_get();
+
+    if (!ignore_cooldown && !conn_params_cooldown_expired(now)) {
+        return;
+    }
+
+    int err = bt_conn_le_param_update(conn,
+                                      BT_LE_CONN_PARAM(preferred_conn_min_interval,
+                                                       preferred_conn_max_interval,
+                                                       preferred_conn_latency,
+                                                       preferred_conn_timeout));
+
+    if (err == -EALREADY || err == -EINPROGRESS) {
+        force_conn_params_failures = 0;
+    } else if (err) {
+        force_conn_params_failures++;
+        LOG_WRN("Failed to request preferred BLE params (%d)", err);
+    } else {
+        force_conn_params_failures = 0;
+        LOG_DBG("Requested preferred BLE params");
+    }
+
+    force_conn_params_last_request = now;
+
+#if CONFIG_ZMK_BLE_FORCE_CONN_PARAMS_MAX_RETRIES > 0
+    if (IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS_DISCONNECT) &&
+        force_conn_params_failures >= CONFIG_ZMK_BLE_FORCE_CONN_PARAMS_MAX_RETRIES) {
+        LOG_WRN("Disconnecting to renegotiate BLE params after %u failures",
+                force_conn_params_failures);
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        force_conn_params_failures = 0;
+        force_conn_params_last_request = k_uptime_get();
+    }
+#endif
+}
+
+static void force_conn_params_reset_state(void) {
+    force_conn_params_last_request = 0;
+    force_conn_params_failures = 0;
+    force_conn_params_waiting_for_activity = false;
+    fast_conn_params_pending = false;
+    fast_conn_params_attempts = 0;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+    fast_conn_params_disconnecting = false;
+#endif
+    conn_params_use_base();
+    preferred_conn_timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT;
+    k_work_cancel_delayable(&force_conn_params_after_activity_work);
+    k_work_cancel_delayable(&fast_conn_params_work);
+}
+
+static void force_conn_params_after_activity(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+
+    if (!conn) {
+        return;
+    }
+
+    force_conn_params_request(conn, false);
+    bt_conn_unref(conn);
+}
+
+static void fast_conn_params_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+
+    if (!conn) {
+        fast_conn_params_pending = false;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+        fast_conn_params_disconnecting = false;
+#endif
+        return;
+    }
+
+    int err = bt_conn_le_param_update(
+        conn, BT_LE_CONN_PARAM(CONFIG_EFOG_BLE_FAST_MIN_INT, CONFIG_EFOG_BLE_FAST_MAX_INT,
+                               CONFIG_EFOG_BLE_FAST_LATENCY, preferred_conn_timeout));
+
+    if (err == -EALREADY) {
+        LOG_DBG("Fast BLE params already active");
+        conn_params_use_fast();
+        fast_conn_params_pending = false;
+        fast_conn_params_attempts = 0;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+        fast_conn_params_disconnecting = false;
+#endif
+    } else if (err == -EINPROGRESS) {
+        LOG_DBG("Fast BLE params request in progress");
+    } else if (err) {
+        LOG_WRN("Fast BLE params request failed (%d)", err);
+        fast_conn_params_attempts++;
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+        if (!fast_conn_params_disconnecting &&
+            fast_conn_params_attempts >= CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT_ATTEMPTS) {
+            fast_conn_params_disconnecting = true;
+            LOG_WRN("Disconnecting to renegotiate BLE params after %u fast failures",
+                    fast_conn_params_attempts);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            fast_conn_params_pending = false;
+            bt_conn_unref(conn);
+            return;
+        }
+#endif
+        bool attempts_left = false;
+#if CONFIG_EFOG_BLE_FAST_REQUEST_RETRIES > 0
+        attempts_left = fast_conn_params_attempts <= CONFIG_EFOG_BLE_FAST_REQUEST_RETRIES;
+#endif
+        if (IS_ENABLED(CONFIG_EFOG_BLE_FAST_RETRY_FOREVER) || attempts_left) {
+            k_work_reschedule(&fast_conn_params_work,
+                              K_MSEC(CONFIG_EFOG_BLE_FAST_REQUEST_SPACING_MS));
+        } else {
+            fast_conn_params_pending = false;
+        }
+    } else {
+        LOG_DBG("Requested fast BLE params");
+#if IS_ENABLED(CONFIG_EFOG_BLE_FAST_FORCE_DISCONNECT)
+        fast_conn_params_disconnecting = false;
+#endif
+    }
+
+    bt_conn_unref(conn);
+}
+#endif /* CONFIG_ZMK_BLE_FORCE_CONN_PARAMS */
 
 BUILD_ASSERT(
     DEVICE_NAME_LEN <= CONFIG_BT_DEVICE_NAME_MAX,
@@ -121,6 +331,21 @@ void set_profile_address(uint8_t index, const bt_addr_le_t *addr) {
 
 bool zmk_ble_active_profile_is_connected(void) {
     return zmk_ble_profile_is_connected(active_profile);
+}
+
+void zmk_ble_notify_activity(void) {
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+    if (!force_conn_params_waiting_for_activity) {
+        return;
+    }
+
+    if (!zmk_ble_active_profile_is_connected()) {
+        return;
+    }
+
+    k_work_reschedule(&force_conn_params_after_activity_work,
+                      K_MSEC(BLE_CONN_PARAMS_RESUME_DELAY_MS));
+#endif
 }
 
 bool zmk_ble_profile_is_connected(uint8_t index) {
@@ -498,6 +723,59 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+static bool clamp_host_conn_params(struct bt_conn *conn, struct bt_le_conn_param *param) {
+    struct bt_conn_info info;
+    bool changed = false;
+
+    bt_conn_get_info(conn, &info);
+
+    if (info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return true;
+    }
+
+    if (!is_conn_active_profile(conn)) {
+        return true;
+    }
+
+    uint16_t original_min = param->interval_min;
+    uint16_t original_max = param->interval_max;
+    uint16_t original_latency = param->latency;
+    uint16_t original_timeout = param->timeout;
+
+    if (param->interval_max > CONFIG_BT_PERIPHERAL_PREF_MAX_INT) {
+        param->interval_max = CONFIG_BT_PERIPHERAL_PREF_MAX_INT;
+        changed = true;
+    }
+
+    if (param->interval_min > param->interval_max) {
+        param->interval_min = param->interval_max;
+        changed = true;
+    }
+
+    if (param->latency > CONFIG_BT_PERIPHERAL_PREF_LATENCY) {
+        param->latency = CONFIG_BT_PERIPHERAL_PREF_LATENCY;
+        changed = true;
+    }
+
+    if (param->timeout > CONFIG_BT_PERIPHERAL_PREF_TIMEOUT) {
+        param->timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT;
+        changed = true;
+    }
+
+    if (changed) {
+        LOG_WRN("Clamping host BLE params from %u-%u/%u/%u to %u-%u/%u/%u", original_min,
+                original_max, original_latency, original_timeout, param->interval_min,
+                param->interval_max, param->latency, param->timeout);
+    } else {
+        LOG_DBG("Accepting host BLE params %u-%u/%u/%u", param->interval_min,
+                param->interval_max, param->latency, param->timeout);
+    }
+
+    return true;
+}
+#endif
+
 static void connected(struct bt_conn *conn, uint8_t err) {
     char addr[BT_ADDR_LE_STR_LEN];
     struct bt_conn_info info;
@@ -522,6 +800,14 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     LOG_DBG("Connected %s", addr);
 
     update_advertising();
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+    force_conn_params_reset_state();
+    if (is_conn_active_profile(conn)) {
+        force_conn_params_waiting_for_activity = true;
+        fast_conn_params_schedule(CONFIG_EFOG_BLE_FAST_REQUEST_DELAY_MS, true);
+    }
+#endif
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
@@ -550,6 +836,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile disconnected");
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+        force_conn_params_reset_state();
+#endif
         k_work_submit(&raise_profile_changed_event_work);
     }
 }
@@ -569,10 +858,46 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
                              uint16_t timeout) {
     char addr[BT_ADDR_LE_STR_LEN];
+    struct bt_conn_info info;
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    bt_conn_get_info(conn, &info);
 
     LOG_DBG("%s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+    if (info.role == BT_CONN_ROLE_PERIPHERAL && is_conn_active_profile(conn)) {
+        if (interval > preferred_conn_max_interval || latency > preferred_conn_latency) {
+            LOG_WRN("BLE params drifted (interval %d, latency %d) – requesting preferred values",
+                    interval, latency);
+            force_conn_params_request(conn, false);
+        } else {
+            force_conn_params_failures = 0;
+            force_conn_params_waiting_for_activity = false;
+            k_work_cancel_delayable(&force_conn_params_after_activity_work);
+        }
+
+        if (intervals_match_fast(interval, latency)) {
+            if (conn_params_mode != CONN_PARAMS_MODE_FAST) {
+                LOG_DBG("Fast BLE params active (interval %d, latency %d)", interval, latency);
+            }
+            conn_params_use_fast();
+            fast_conn_params_pending = false;
+            fast_conn_params_attempts = 0;
+            k_work_cancel_delayable(&fast_conn_params_work);
+        } else {
+            if (conn_params_mode == CONN_PARAMS_MODE_FAST) {
+                LOG_DBG("Host stepped off fast BLE params (interval %d, latency %d)", interval,
+                        latency);
+                conn_params_use_base();
+            }
+
+            if (!fast_conn_params_pending) {
+                fast_conn_params_schedule(CONFIG_EFOG_BLE_FAST_REQUEST_DELAY_MS, true);
+            }
+        }
+    }
+#endif
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -580,6 +905,9 @@ static struct bt_conn_cb conn_callbacks = {
     .disconnected = disconnected,
     .security_changed = security_changed,
     .le_param_updated = le_param_updated,
+#if IS_ENABLED(CONFIG_ZMK_BLE_FORCE_CONN_PARAMS)
+    .le_param_req = clamp_host_conn_params,
+#endif
 };
 
 /*
